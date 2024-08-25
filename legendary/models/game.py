@@ -18,6 +18,7 @@ class GameAsset:
     label_name: str = ''
     namespace: str = ''
     metadata: Dict = field(default_factory=dict)
+    sidecar_rev: int = 0
 
     @classmethod
     def from_egs_json(cls, json):
@@ -29,6 +30,7 @@ class GameAsset:
         tmp.label_name = json.get('labelName', '')
         tmp.namespace = json.get('namespace', '')
         tmp.metadata = json.get('metadata', {})
+        tmp.sidecar_rev = json.get('sidecarRvn', 0)
         return tmp
 
     @classmethod
@@ -41,7 +43,24 @@ class GameAsset:
         tmp.label_name = json.get('label_name', '')
         tmp.namespace = json.get('namespace', '')
         tmp.metadata = json.get('metadata', {})
+        tmp.sidecar_rev = json.get('sidecar_rev', 0)
         return tmp
+
+
+@dataclass
+class Sidecar:
+    """
+    App sidecar data
+    """
+    config: Dict
+    rev: int
+
+    @classmethod
+    def from_json(cls, json):
+        return cls(
+            config=json.get('config', {}),
+            rev=json.get('rev', 0)
+        )
 
 
 @dataclass
@@ -55,6 +74,7 @@ class Game:
     asset_infos: Dict[str, GameAsset] = field(default_factory=dict)
     base_urls: List[str] = field(default_factory=list)
     metadata: Dict = field(default_factory=dict)
+    sidecar: Optional[Sidecar] = None
 
     def app_version(self, platform='Windows'):
         if platform not in self.asset_infos:
@@ -66,7 +86,11 @@ class Game:
         return self.metadata and 'mainGameItem' in self.metadata
 
     @property
-    def third_party_store(self):
+    def is_origin_game(self) -> bool:
+        return self.third_party_store and self.third_party_store.lower() in ['origin', 'the ea app']
+
+    @property
+    def third_party_store(self) -> Optional[str]:
         if not self.metadata:
             return None
         return self.metadata.get('customAttributes', {}).get('ThirdPartyManagedApp', {}).get('value', None)
@@ -90,6 +114,18 @@ class Game:
     @property
     def supports_mac_cloud_saves(self):
         return self.metadata and (self.metadata.get('customAttributes', {}).get('CloudSaveFolder_MAC') is not None)
+
+    @property
+    def additional_command_line(self):
+        if not self.metadata:
+            return None
+        return self.metadata.get('customAttributes', {}).get('AdditionalCommandLine', {}).get('value', None)
+
+    @property
+    def is_launchable_addon(self):
+        if not self.metadata:
+            return False
+        return any(m['path'] == 'addons/launchable' for m in self.metadata.get('categories', []))
 
     @property
     def catalog_item_id(self):
@@ -116,6 +152,9 @@ class Game:
             # Migrate old asset_info to new asset_infos
             tmp.asset_infos['Windows'] = GameAsset.from_json(json.get('asset_info', dict()))
 
+        if sidecar := json.get('sidecar', None):
+            tmp.sidecar = Sidecar.from_json(sidecar)
+
         tmp.base_urls = json.get('base_urls', list())
         return tmp
 
@@ -123,8 +162,9 @@ class Game:
     def __dict__(self):
         """This is just here so asset_infos gets turned into a dict as well"""
         assets_dictified = {k: v.__dict__ for k, v in self.asset_infos.items()}
+        sidecar_dictified = self.sidecar.__dict__ if self.sidecar else None
         return dict(metadata=self.metadata, asset_infos=assets_dictified, app_name=self.app_name,
-                    app_title=self.app_title, base_urls=self.base_urls)
+                    app_title=self.app_title, base_urls=self.base_urls, sidecar=sidecar_dictified)
 
 
 @dataclass
@@ -149,6 +189,7 @@ class InstalledGame:
     needs_verification: bool = False
     platform: str = 'Windows'
     prereq_info: Optional[Dict] = None
+    uninstaller: Optional[Dict] = None
     requires_ot: bool = False
     save_path: Optional[str] = None
 
@@ -165,6 +206,7 @@ class InstalledGame:
         tmp.executable = json.get('executable', '')
         tmp.launch_parameters = json.get('launch_parameters', '')
         tmp.prereq_info = json.get('prereq_info', None)
+        tmp.uninstaller = json.get('uninstaller', None)
 
         tmp.can_run_offline = json.get('can_run_offline', False)
         tmp.requires_ot = json.get('requires_ot', False)

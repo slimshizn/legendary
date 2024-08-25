@@ -131,7 +131,8 @@ class LegendaryCore:
         Handles authentication via authorization code (either retrieved manually or automatically)
         """
         try:
-            self.lgd.userdata = self.egs.start_session(authorization_code=code)
+            with self.lgd.userdata_lock as lock:
+                lock.data = self.egs.start_session(authorization_code=code)
             return True
         except Exception as e:
             self.log.error(f'Logging in failed with {e!r}, please try again.')
@@ -142,7 +143,8 @@ class LegendaryCore:
         Handles authentication via exchange token (either retrieved manually or automatically)
         """
         try:
-            self.lgd.userdata = self.egs.start_session(exchange_token=code)
+            with self.lgd.userdata_lock as lock:
+                lock.data = self.egs.start_session(exchange_token=code)
             return True
         except Exception as e:
             self.log.error(f'Logging in failed with {e!r}, please try again.')
@@ -171,22 +173,23 @@ class LegendaryCore:
             raise ValueError('No login session in config')
         refresh_token = re_data['Token']
         try:
-            self.lgd.userdata = self.egs.start_session(refresh_token=refresh_token)
+            with self.lgd.userdata_lock as lock:
+                lock.data = self.egs.start_session(refresh_token=refresh_token)
             return True
         except Exception as e:
             self.log.error(f'Logging in failed with {e!r}, please try again.')
             return False
 
-    def login(self, force_refresh=False) -> bool:
+    def _login(self, lock, force_refresh=False) -> bool:
         """
         Attempts logging in with existing credentials.
 
         raises ValueError if no existing credentials or InvalidCredentialsError if the API return an error
         """
-        if not self.lgd.userdata:
+        if not lock.data:
             raise ValueError('No saved credentials')
-        elif self.logged_in and self.lgd.userdata['expires_at']:
-            dt_exp = datetime.fromisoformat(self.lgd.userdata['expires_at'][:-1])
+        elif self.logged_in and lock.data['expires_at']:
+            dt_exp = datetime.fromisoformat(lock.data['expires_at'][:-1])
             dt_now = datetime.utcnow()
             td = dt_now - dt_exp
 
@@ -212,8 +215,8 @@ class LegendaryCore:
             except Exception as e:
                 self.log.warning(f'Checking for EOS Overlay updates failed: {e!r}')
 
-        if self.lgd.userdata['expires_at'] and not force_refresh:
-            dt_exp = datetime.fromisoformat(self.lgd.userdata['expires_at'][:-1])
+        if lock.data['expires_at'] and not force_refresh:
+            dt_exp = datetime.fromisoformat(lock.data['expires_at'][:-1])
             dt_now = datetime.utcnow()
             td = dt_now - dt_exp
 
@@ -221,7 +224,7 @@ class LegendaryCore:
             if dt_exp > dt_now and abs(td.total_seconds()) > 600:
                 self.log.info('Trying to re-use existing login session...')
                 try:
-                    self.egs.resume_session(self.lgd.userdata)
+                    self.egs.resume_session(lock.data)
                     self.logged_in = True
                     return True
                 except InvalidCredentialsError as e:
@@ -233,18 +236,22 @@ class LegendaryCore:
 
         try:
             self.log.info('Logging in...')
-            userdata = self.egs.start_session(self.lgd.userdata['refresh_token'])
+            userdata = self.egs.start_session(lock.data['refresh_token'])
         except InvalidCredentialsError:
             self.log.error('Stored credentials are no longer valid! Please login again.')
-            self.lgd.invalidate_userdata()
+            lock.clear()
             return False
         except (HTTPError, ConnectionError) as e:
             self.log.error(f'HTTP request for login failed: {e!r}, please try again later.')
             return False
 
-        self.lgd.userdata = userdata
+        lock.data = userdata
         self.logged_in = True
         return True
+
+    def login(self, force_refresh=False) -> bool:
+        with self.lgd.userdata_lock as lock:
+            return self._login(lock, force_refresh=force_refresh)
 
     def update_check_enabled(self):
         return not self.lgd.config.getboolean('Legendary', 'disable_update_check', fallback=False)
@@ -293,6 +300,9 @@ class LegendaryCore:
                         sdl_games[app_name] = None
         if lgd_config := version_info.get('legendary_config'):
             self.webview_killswitch = lgd_config.get('webview_killswitch', False)
+
+    def get_egl_version(self):
+        return self._egl_version
 
     def get_update_info(self):
         return self.lgd.get_cached_version()['data'].get('release_info')
@@ -421,25 +431,46 @@ class LegendaryCore:
                 continue
 
             game = self.lgd.get_game_meta(app_name)
-            asset_updated = False
+            asset_updated = sidecar_updated = False
             if game:
                 asset_updated = any(game.app_version(_p) != app_assets[_p].build_version for _p in app_assets.keys())
+                # assuming sidecar data is the same for all platforms, just check the baseline (Windows) for updates.
+                sidecar_updated = (app_assets['Windows'].sidecar_rev > 0 and
+                                   (not game.sidecar or game.sidecar.rev != app_assets['Windows'].sidecar_rev))
                 games[app_name] = game
 
-            if update_assets and (not game or force_refresh or (game and asset_updated)):
+            if update_assets and (not game or force_refresh or (game and (asset_updated or sidecar_updated))):
                 self.log.debug(f'Scheduling metadata update for {app_name}')
                 # namespace/catalog item are the same for all platforms, so we can just use the first one
                 _ga = next(iter(app_assets.values()))
-                fetch_list.append((app_name, _ga.namespace, _ga.catalog_item_id))
+                fetch_list.append((app_name, _ga.namespace, _ga.catalog_item_id, sidecar_updated))
                 meta_updated = True
 
         def fetch_game_meta(args):
-            app_name, namespace, catalog_item_id = args
+            app_name, namespace, catalog_item_id, update_sidecar = args
             eg_meta = self.egs.get_game_info(namespace, catalog_item_id, timeout=10.0)
-            game = Game(app_name=app_name, app_title=eg_meta['title'], metadata=eg_meta, asset_infos=assets[app_name])
+            if not eg_meta:
+                self.log.warning(f'App {app_name} does not have any metadata!')
+                eg_meta = dict(title='Unknown')
+
+            sidecar = None
+            if update_sidecar:
+                self.log.debug(f'Updating sidecar information for {app_name}...')
+                manifest_api_response = self.egs.get_game_manifest(namespace, catalog_item_id, app_name)
+                # sidecar data is a JSON object encoded as a string for some reason
+                manifest_info = manifest_api_response['elements'][0]
+                if 'sidecar' in manifest_info:
+                    sidecar_json = json.loads(manifest_info['sidecar']['config'])
+                    sidecar = Sidecar(config=sidecar_json, rev=manifest_info['sidecar']['rvn'])
+
+            game = Game(app_name=app_name, app_title=eg_meta['title'], metadata=eg_meta, asset_infos=assets[app_name],
+                        sidecar=sidecar)
             self.lgd.set_game_meta(game.app_name, game)
             games[app_name] = game
-            still_needs_update.remove(app_name)
+            try:
+                still_needs_update.remove(app_name)
+            except KeyError:
+                pass
 
         # setup and teardown of thread pool takes some time, so only do it when it makes sense.
         still_needs_update = {e[0] for e in fetch_list}
@@ -460,7 +491,7 @@ class LegendaryCore:
                 if use_threads:
                     self.log.warning(f'Fetching metadata for {app_name} failed, retrying')
                 _ga = next(iter(app_assets.values()))
-                fetch_game_meta((app_name, _ga.namespace, _ga.catalog_item_id))
+                fetch_game_meta((app_name, _ga.namespace, _ga.catalog_item_id, True))
                 game = games[app_name]
 
             if game.is_dlc and platform in app_assets:
@@ -507,11 +538,17 @@ class LegendaryCore:
         _dlc = defaultdict(list)
         # get all the appnames we have to ignore
         ignore = set(i.app_name for i in self.get_assets())
+        # broken old app name that we should always ignore
+        ignore |= {'1'}
 
         for libitem in self.egs.get_library_items():
             if libitem['namespace'] == 'ue' and skip_ue:
                 continue
+            if 'appName' not in libitem:
+                continue
             if libitem['appName'] in ignore:
+                continue
+            if libitem['sandboxType'] == 'PRIVATE':
                 continue
 
             game = self.lgd.get_game_meta(libitem['appName'])
@@ -672,9 +709,10 @@ class LegendaryCore:
                               disable_wine: bool = False,
                               executable_override: str = None,
                               crossover_app: str = None,
-                              crossover_bottle: str = None) -> LaunchParameters:
+                              crossover_bottle: str = None,
+                              addon_app_name: str = None) -> LaunchParameters:
         install = self.lgd.get_installed_game(app_name)
-        game = self.lgd.get_game_meta(app_name)
+        game = self.lgd.get_game_meta(addon_app_name if addon_app_name else app_name)
 
         # Disable wine for non-Windows executables (e.g. native macOS)
         if not install.platform.startswith('Win'):
@@ -716,6 +754,13 @@ class LegendaryCore:
                 self.log.warning(f'Parsing predefined launch parameters failed with: {e!r}, '
                                  f'input: {install.launch_parameters}')
 
+        if meta_args := game.additional_command_line:
+            try:
+                params.game_parameters.extend(shlex.split(meta_args.strip(), posix=False))
+            except ValueError as e:
+                self.log.warning(f'Parsing metadata launch parameters failed with: {e!r}, '
+                                 f'input: {install.launch_parameters}')
+
         game_token = ''
         if not offline:
             self.log.info('Getting authentication token...')
@@ -752,6 +797,10 @@ class LegendaryCore:
             f'-epiclocale={language_code}',
             f'-epicsandboxid={game.namespace}'
         ])
+
+        if sidecar := game.sidecar:
+            if deployment_id := sidecar.config.get('deploymentId', None):
+                params.egl_parameters.append(f'-epicdeploymentid={deployment_id}')
 
         if extra_args:
             params.user_parameters.extend(extra_args)
@@ -1282,7 +1331,7 @@ class LegendaryCore:
                          repair: bool = False, repair_use_latest: bool = False,
                          disable_delta: bool = False, override_delta_manifest: str = '',
                          egl_guid: str = '', preferred_cdn: str = None,
-                         disable_https: bool = False) -> (DLManager, AnalysisResult, ManifestMeta):
+                         disable_https: bool = False, bind_ip: str = None) -> (DLManager, AnalysisResult, ManifestMeta):
         # load old manifest
         old_manifest = None
 
@@ -1449,7 +1498,7 @@ class LegendaryCore:
 
         dlm = DLManager(install_path, base_url, resume_file=resume_file, status_q=status_q,
                         max_shared_memory=max_shm * 1024 * 1024, max_workers=max_workers,
-                        dl_timeout=dl_timeout)
+                        dl_timeout=dl_timeout, bind_ip=bind_ip)
         anlres = dlm.run_analysis(manifest=new_manifest, old_manifest=old_manifest,
                                   patch=not disable_patching, resume=not force,
                                   file_prefix_filter=file_prefix_filter,
@@ -1462,8 +1511,13 @@ class LegendaryCore:
             prereq = dict(ids=new_manifest.meta.prereq_ids, name=new_manifest.meta.prereq_name,
                           path=new_manifest.meta.prereq_path, args=new_manifest.meta.prereq_args)
 
+        uninstaller = None
+        if new_manifest.meta.uninstall_action_path:
+            uninstaller = dict(path=new_manifest.meta.uninstall_action_path,
+                               args=new_manifest.meta.uninstall_action_args)
+
         offline = game.metadata.get('customAttributes', {}).get('CanRunOffline', {}).get('value', 'true')
-        ot = game.metadata.get('customAttributes', {}).get('OwnershipToken', {}).get('value', 'false')
+        ot = game.metadata.get('customAttributes', {}).get('OwnershipToken', {}).get('value', 'false').lower()
 
         if file_install_tag is None:
             file_install_tag = []
@@ -1485,7 +1539,7 @@ class LegendaryCore:
                               can_run_offline=offline == 'true', requires_ot=ot == 'true',
                               is_dlc=base_game is not None, install_size=anlres.install_size,
                               egl_guid=egl_guid, install_tags=file_install_tag,
-                              platform=platform)
+                              platform=platform, uninstaller=uninstaller)
 
         return dlm, anlres, igame
 
@@ -1585,6 +1639,21 @@ class LegendaryCore:
             alt_str = '\n'.join(f'   + {alt}' for alt in alts)
             results.warnings.add('You may want to consider trying one of the following executables '
                                  f'(see README for launch parameter/config option usage):\n{alt_str}')
+
+        # Detect EOS service
+        eos_installer = next((f for f in analysis.manifest_comparison.added
+                              if 'epiconlineservicesinstaller' in f.lower()), None)
+        has_bootstrapper = any('eosbootstrapper' in f.lower() for f in analysis.manifest_comparison.added)
+
+        if eos_installer:
+            results.warnings.add('This game ships the Epic Online Services Windows service, '
+                                 'it may have to be installed for the game to work properly. '
+                                 f'To do so, run "{eos_installer}" inside the game directory '
+                                 f'after the install has finished.')
+        elif has_bootstrapper:
+            results.warnings.add('This game ships the Epic Online Services bootstrapper. '
+                                 'The Epic Online Services Windows service may have to be '
+                                 'installed manually for the game to function properly.')
 
         return results
 
@@ -1714,7 +1783,7 @@ class LegendaryCore:
                           path=new_manifest.meta.prereq_path, args=new_manifest.meta.prereq_args)
 
         offline = game.metadata.get('customAttributes', {}).get('CanRunOffline', {}).get('value', 'true')
-        ot = game.metadata.get('customAttributes', {}).get('OwnershipToken', {}).get('value', 'false')
+        ot = game.metadata.get('customAttributes', {}).get('OwnershipToken', {}).get('value', 'false').lower()
         igame = InstalledGame(app_name=game.app_name, title=game.app_title, prereq_info=prereq, base_urls=base_urls,
                               install_path=app_path, version=new_manifest.meta.build_version, is_dlc=game.is_dlc,
                               executable=new_manifest.meta.launch_exe, can_run_offline=offline == 'true',
@@ -1739,6 +1808,9 @@ class LegendaryCore:
     def egl_import(self, app_name):
         if not self.asset_valid(app_name):
             raise ValueError(f'To-be-imported game {app_name} not in game asset database!')
+        if not self.lgd.lock_installed():
+            self.log.warning('Could not acquire lock for EGL import')
+            return
 
         self.log.debug(f'Importing "{app_name}" from EGL')
         # load egl json file
@@ -1786,9 +1858,12 @@ class LegendaryCore:
 
         # mark game as installed
         _ = self._install_game(lgd_igame)
-        return
 
     def egl_export(self, app_name):
+        if not self.lgd.lock_installed():
+            self.log.warning('Could not acquire lock for EGL import')
+            return
+
         self.log.debug(f'Exporting "{app_name}" to EGL')
         # load igame/game
         lgd_game = self.get_game(app_name)
@@ -1850,6 +1925,10 @@ class LegendaryCore:
         """
         Sync game installs between Legendary and the Epic Games Launcher
         """
+        if not self.lgd.lock_installed():
+            self.log.warning('Could not acquire lock for EGL sync')
+            return
+
         # read egl json files
         if app_name:
             lgd_igame = self._get_installed_game(app_name)
